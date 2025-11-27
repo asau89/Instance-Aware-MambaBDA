@@ -1,4 +1,6 @@
 import sys
+
+
 sys.path.append('/home/granbell')
 
 import argparse
@@ -14,20 +16,20 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from MambaCD.changedetection.datasets.make_data_loader import DamageAssessmentDatset, make_data_loader
+from MambaCD.changedetection.datasets.make_data_loader import DamageAssessmentDatset, MultimodalDamageAssessmentDatset, make_data_loader
 from MambaCD.changedetection.utils_func.metrics import Evaluator
-from MambaCD.changedetection.models.ChangeMambaBDA import ChangeMambaBDA
+from MambaCD.changedetection.models.ChangeMambaMMBDA import ChangeMambaMMBDA
 import imageio
 import numpy as np
 import seaborn as sns
 
 
+# Updated dictionaries to reflect only 4 classes (0, 1, 2, 3) from the image legend
 ori_label_value_dict = {
-    'background': (0, 0, 0),
-    'no_damage': (70, 181, 121),
-    'minor_damage': (167, 187, 27),
-    'major_damage': (228, 189, 139),
-    'destroy': (181, 70, 70)
+    'background': (68, 1, 84),      # Approximated dark purple from the image's background/viridis start
+    'no_damage': (59, 82, 139),     # Approximated darker blue/purple (Class ID 1)
+    'minor_damage': (33, 145, 140), # Approximated teal/green (Class ID 2)
+    'major_damage': (253, 231, 37)  # Approximated bright yellow (Class ID 3)
 }
 
 target_label_value_dict = {
@@ -35,7 +37,6 @@ target_label_value_dict = {
     'no_damage': 1,
     'minor_damage': 2,
     'major_damage': 3,
-    'destroy': 4,
 }
 
 def map_labels_to_colors(labels, ori_label_value_dict, target_label_value_dict):
@@ -61,13 +62,21 @@ class Trainer(object):
         self.args = args
         config = get_config(args)
 
-        self.evaluator_loc = Evaluator(num_class=2)
-        self.evaluator_clf = Evaluator(num_class=5)
-        self.total_evaluator_loc = Evaluator(num_class=2)
-        self.total_evaluator_clf = Evaluator(num_class=5)
 
-        self.deep_model = ChangeMambaBDA(
-            output_building=2, output_damage=5,
+        self.evaluator_loc = Evaluator(num_class=2)
+        # evaluator_clf remains num_class=4, assuming model's 4 outputs map to 0,1,2,3 
+        # for 'background', 'no_damage', 'minor_damage', 'major_damage' respectively.
+        self.evaluator_clf = Evaluator(num_class=4) 
+        self.total_evaluator_loc = Evaluator(num_class=2)
+        self.total_evaluator_clf = Evaluator(num_class=4)
+        self.evaluator_event_noto = Evaluator(num_class=4)
+        self.evaluator_event_marshall = Evaluator(num_class=4)
+
+        self.deep_model = ChangeMambaMMBDA(
+            output_building=2, 
+            # output_damage=4 is kept as it is consistent with the 4 classes (0,1,2,3) 
+            # now defined in target_label_value_dict for visualization.
+            output_damage=4, 
             pretrained=args.pretrained_weight_path,
             patch_size=config.MODEL.VSSM.PATCH_SIZE, 
             in_chans=config.MODEL.VSSM.IN_CHANS, 
@@ -97,7 +106,8 @@ class Trainer(object):
             patchembed_version=config.MODEL.VSSM.PATCHEMBED,
             gmlp=config.MODEL.VSSM.GMLP,
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
-        ) 
+            ) 
+       
         self.deep_model = self.deep_model.cuda()
         self.lr = args.learning_rate
         self.epoch = args.max_iters // args.batch_size
@@ -122,18 +132,29 @@ class Trainer(object):
                     model_dict[k] = v
             state_dict.update(model_dict)
             self.deep_model.load_state_dict(state_dict)
-
+            
         self.deep_model.eval()
 
 
     def infer(self):
         torch.cuda.empty_cache()
-        dataset = DamageAssessmentDatset(self.args.test_dataset_path, self.args.test_data_name_list, 256, None, 'test')
+        dataset = MultimodalDamageAssessmentDatset(
+            self.args.test_dataset_path,
+            self.args.test_data_name_list,
+            256,
+            None,
+            'test'
+        )
         val_data_loader = DataLoader(dataset, batch_size=1, num_workers=4, drop_last=False)
         torch.cuda.empty_cache()
+
+        # Reset evaluators
         self.total_evaluator_loc.reset()
-        self.total_evaluator_clf.reset()          
-        # vbar = tqdm(val_data_loader, ncols=50)
+        self.total_evaluator_clf.reset()
+
+        # ⬅️ Added: evaluators for overall performance
+        evaluator_total = Evaluator(num_class=4)
+
         with torch.no_grad():
             for itera, data in enumerate(tqdm(val_data_loader)):
                 pre_change_imgs, post_change_imgs, labels_loc, labels_clf, names = data
@@ -142,7 +163,6 @@ class Trainer(object):
                 post_change_imgs = post_change_imgs.cuda()
                 labels_loc = labels_loc.cuda().long()
                 labels_clf = labels_clf.cuda().long()
-
 
                 output_loc, output_clf = self.deep_model(pre_change_imgs, post_change_imgs)
 
@@ -154,30 +174,74 @@ class Trainer(object):
                 output_clf = np.argmax(output_clf, axis=1)
                 labels_clf = labels_clf.cpu().numpy()
 
+                # Add for localization evaluation
                 self.total_evaluator_loc.add_batch(labels_loc, output_loc)
-                
+
+                # Only evaluate damage classes where building exists
                 output_clf_eval = output_clf[labels_loc > 0]
                 labels_clf_eval = labels_clf[labels_loc > 0]
                 self.total_evaluator_clf.add_batch(labels_clf_eval, output_clf_eval)
 
+                # ⬅️ Added: total evaluator includes all pixels (for OA & mIoU)
+                evaluator_total.add_batch(labels_clf, output_clf)
 
+                # ========== Visualization ==========
                 image_name = names[0] + '.png'
-
                 output_loc = np.squeeze(output_loc)
                 output_loc[output_loc > 0] = 255
 
-                output_clf = map_labels_to_colors(np.squeeze(output_clf), ori_label_value_dict=ori_label_value_dict, target_label_value_dict=target_label_value_dict)
-                output_clf[output_loc == 0] = 0
+                # Map classification predictions to colors
+                output_clf_color = map_labels_to_colors(
+                    np.squeeze(output_clf),
+                    ori_label_value_dict=ori_label_value_dict,
+                    target_label_value_dict=target_label_value_dict
+                )
+                output_clf_color[output_loc == 0] = ori_label_value_dict['background']
 
-                imageio.imwrite(os.path.join(self.building_map_T1_saved_path, image_name), output_loc.astype(np.uint8))
-                imageio.imwrite(os.path.join(self.change_map_T2_saved_path, image_name), output_clf.astype(np.uint8))
+                imageio.imwrite(os.path.join(self.building_map_T1_saved_path, image_name),
+                                output_loc.astype(np.uint8))
+                imageio.imwrite(os.path.join(self.change_map_T2_saved_path, image_name),
+                                output_clf_color.astype(np.uint8))
 
+        # ========== Compute Metrics ==========
         loc_f1_score = self.total_evaluator_loc.Pixel_F1_score()
         damage_f1_score = self.total_evaluator_clf.Damage_F1_score()
-        harmonic_mean_f1 = len(damage_f1_score) / np.sum(1.0 / damage_f1_score)
+        harmonic_mean_f1 = len(damage_f1_score) / np.sum(1.0 / (damage_f1_score + 1e-8))
         oaf1 = 0.3 * loc_f1_score + 0.7 * harmonic_mean_f1
-        print(f'locF1 is {loc_f1_score}, clfF1 is {harmonic_mean_f1}, oaF1 is {oaf1}, '
-              f'sub class F1 score is {damage_f1_score}')
+
+        # ⬅️ Added: Overall metrics (same as first script)
+        final_OA = evaluator_total.Pixel_Accuracy()
+        IoU_of_each_class = evaluator_total.Intersection_over_Union()
+        mIoU = evaluator_total.Mean_Intersection_over_Union()
+
+        # ========== Per-class F1 Report ==========
+        reverse_target_label_value_dict = {v: k for k, v in target_label_value_dict.items()}
+        class_names_for_f1 = [reverse_target_label_value_dict[i] for i in range(1, len(damage_f1_score) + 1)]
+
+        f1_scores_with_classes = ", ".join(
+            [f"{name}: {score:.8f}" for name, score in zip(class_names_for_f1, damage_f1_score)]
+        )
+
+        print("\n===== TEST METRICS =====")
+        print(f"loc F1 (test): {loc_f1_score}")
+        print(f"clf F1 (test): {harmonic_mean_f1}")
+        print(f"OA (test): {100 * final_OA}")
+        print(f"mIoU (test): {100 * mIoU}")
+        print(f"sub class IoU (test): {100 * IoU_of_each_class}")
+        print(f"sub class F1 (test): {f1_scores_with_classes}")
+        print(f"OA-F1 (weighted): {oaf1}")
+        print("========================\n")
+
+        # ⬅️ Added: Return the metrics if needed by external scripts
+        return {
+            "loc F1": loc_f1_score,
+            "clf F1": harmonic_mean_f1,
+            "OA": final_OA,
+            "mIoU": mIoU,
+            "sub class IoU": IoU_of_each_class,
+            "sub class F1": damage_f1_score,
+            "OA-F1": oaf1
+        }
 
 
 def main():
@@ -191,7 +255,7 @@ def main():
     )
     parser.add_argument('--pretrained_weight_path', type=str)
     parser.add_argument('--dataset', type=str, default='xBD')
-    parser.add_argument('--type', type=str, default='train')
+    parser.add_argument('--type', type=str, default='test')
     parser.add_argument('--test_dataset_path', type=str, default='/home/songjian/project/datasets/SYSU/test')
     parser.add_argument('--test_data_list_path', type=str, default='/home/songjian/project/datasets/SYSU/test_list.txt')
     parser.add_argument('--shuffle', type=bool, default=True)

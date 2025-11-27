@@ -26,7 +26,7 @@ from MambaCD.changedetection.utils_func.metrics import Evaluator
 from MambaCD.changedetection.models.ChangeMambaMMBDA import ChangeMambaMMBDA
 import MambaCD.changedetection.utils_func.lovasz_loss as L
 # Import the new, spatially aware loss function
-from MambaCD.changedetection.utils_func.instance_consistency_loss import InstanceConsistencyLoss
+from MambaCD.changedetection.utils_func.force_directed_loss import SpatiallyAwareForceLoss
 from torch.cuda.amp import autocast, GradScaler
 
 
@@ -78,9 +78,14 @@ class Trainer(object):
         self.evaluator_clf = Evaluator(num_class=4)
         self.evaluator_total = Evaluator(num_class=4)
 
-    
-        # Instance Consistency Loss Initialization
-        self.inst_consistency_loss = InstanceConsistencyLoss()
+        # Use the new Spatially Aware Force-Directed Loss
+        self.force_directed_loss = SpatiallyAwareForceLoss(
+            repulsion_margin=args.repulsion_margin,
+            weight_attraction=args.weight_attraction,
+            weight_repulsion=args.weight_repulsion,
+            spatial_sigma=args.spatial_sigma,
+        )
+
         # Initialize model
         self.deep_model = ChangeMambaMMBDA(
             output_building=2, output_damage=4,
@@ -134,81 +139,88 @@ class Trainer(object):
         # Lists for plotting losses
         self.iterations = []
         self.bda_losses, self.inst_losses, self.final_losses = [], [], []
+        self.inst_loc_losses_unweighted, self.inst_clf_losses_unweighted = [], []
 
+    def get_boundary_weights(self, masks: torch.Tensor, boundary_weight=10.0) -> torch.Tensor:
+        """
+        Calculates weights for the cross-entropy loss that emphasize object boundaries.
+        Args:
+            masks (torch.Tensor): The ground truth masks, shape (B, H, W).
+            boundary_weight (float): The weight to apply to boundary pixels.
+        Returns:
+            torch.Tensor: A weight map of shape (B, H, W) where boundary pixels have higher values.
+        """
+        with torch.no_grad():
+            masks_np = masks.cpu().numpy()
+            weights = torch.zeros_like(masks, dtype=torch.float32)
+
+            for i in range(masks_np.shape[0]):
+                # Use a simple binary distinction (background vs. any building) for boundary detection.
+                binary_mask = (masks_np[i] > 0).astype(np.uint8)
+                
+                # Use Sobel filter to find edges/boundaries
+                edge = sobel(binary_mask) > 0
+                
+                # Create a weight map where non-boundary pixels have weight 1
+                # and boundary pixels have a higher weight.
+                weight_map = np.ones_like(masks_np[i], dtype=np.float32)
+                weight_map[edge] = boundary_weight
+                weights[i] = torch.from_numpy(weight_map)
+                
+        return weights.to(masks.device)
 
     # ============================================================
     # ✅ 3. TRAINING LOOP
     # ============================================================
     def training(self):
-        best_mIoU = 0.0
-        best_round = []
+        best_mIoU, best_round = 0.0, {}
         torch.cuda.empty_cache()
-        elem_num = len(self.train_data_loader)
-        train_enumerator = enumerate(self.train_data_loader)
+        progress_bar = tqdm(self.train_data_loader, desc="Training Progress")
+
         class_weights = torch.FloatTensor([1, 1, 1, 1]).cuda()
 
-        progress_bar = tqdm(range(elem_num), desc="Training Progress")
-        for itera_idx in progress_bar:
-            itera, data = train_enumerator.__next__()
+        for itera, data in enumerate(progress_bar):
             pre_change_imgs, post_change_imgs, labels_loc, labels_clf, _ = data
+            pre_change_imgs, post_change_imgs = pre_change_imgs.cuda(), post_change_imgs.cuda()
+            labels_loc, labels_clf = labels_loc.cuda().long(), labels_clf.cuda().long()
 
-            pre_change_imgs = pre_change_imgs.cuda()
-            post_change_imgs = post_change_imgs.cuda()
-            labels_loc = labels_loc.cuda().long()
-            labels_clf = labels_clf.cuda().long()
+            if not (labels_clf != 255).any():
+                continue
 
-            valid_labels_clf = (labels_clf != 255).any()
-            if not valid_labels_clf:
-               continue
+            self.optim.zero_grad()
 
-           # ==============================
-            # === Forward + Loss Section ===
-            # ==============================
-            self.optim.zero_grad(set_to_none=True)
+            with autocast():
+                pred_loc, pred_clf, feat_loc, feat_clf = self.deep_model(pre_change_imgs, post_change_imgs)
 
-            # ---------------- AMP Forward Pass ----------------
-            with autocast(enabled=True):
-                pred_loc, pred_clf, features_loc, features_clf, features_loc_hr, features_clf_hr = self.deep_model(
-                    pre_change_imgs, post_change_imgs
-                )
+                # --- Boundary-Aware Cross-Entropy Loss ---
+                boundary_weights_loc = self.get_boundary_weights(labels_loc)
+                boundary_weights_clf = self.get_boundary_weights(labels_clf)
+                
+                ce_loc_unreduced = F.cross_entropy(pred_loc, labels_loc, ignore_index=255, reduction='none')
+                ce_loc = (ce_loc_unreduced * boundary_weights_loc).mean()
+                
+                lovasz_loc = L.lovasz_softmax(F.softmax(pred_loc, dim=1), labels_loc, ignore=255)
+                
+                ce_clf_unreduced = F.cross_entropy(pred_clf, labels_clf, weight=class_weights, ignore_index=255, reduction='none')
+                ce_clf = (ce_clf_unreduced * boundary_weights_clf).mean()
 
-                # --- Standard BDA Losses ---
-                ce_loss_loc = F.cross_entropy(pred_loc, labels_loc, ignore_index=255)
-                lovasz_loss_loc = L.lovasz_softmax(F.softmax(pred_loc, dim=1), labels_loc, ignore=255)
+                lovasz_clf = L.lovasz_softmax(F.softmax(pred_clf, dim=1), labels_clf, ignore=255)
 
-                ce_loss_clf = F.cross_entropy(pred_clf, labels_clf, weight=class_weights, ignore_index=255)
-                lovasz_loss_clf = L.lovasz_softmax(F.softmax(pred_clf, dim=1), labels_clf, ignore=255)
+                bda_loss = (ce_loc + 0.5 * lovasz_loc) + (ce_clf + 0.75 * lovasz_clf)
 
-                bda_loss = (ce_loss_loc + 0.5 * lovasz_loss_loc) + (ce_loss_clf + 0.75 * lovasz_loss_clf)
+                size = feat_loc.shape[-2:]
+                labels_loc_down = F.interpolate(labels_loc.unsqueeze(1).float(), size=size, mode='nearest').squeeze(1).long()
+                labels_clf_down = F.interpolate(labels_clf.unsqueeze(1).float(), size=size, mode='nearest').squeeze(1).long()
 
-            # ---------------- FP32 Instance Loss ----------------
-            # Compute instance losses outside autocast to prevent underflow
-            feature_map_size_hr = features_loc_hr.shape[-2:]
-            labels_loc_down_hr = F.interpolate(labels_loc.unsqueeze(1).float(), size=feature_map_size_hr, mode='nearest').squeeze(1).long()
-            labels_clf_down_hr = F.interpolate(labels_clf.unsqueeze(1).float(), size=feature_map_size_hr, mode='nearest').squeeze(1).long()
-
-            loss_inst_loc = self.inst_consistency_loss(features_loc_hr.float(), labels_loc_down_hr)
-            loss_inst_clf = self.inst_consistency_loss(features_clf_hr.float(), labels_clf_down_hr)
-
-            inst_loss = self.args.alpha * loss_inst_loc + self.args.beta * loss_inst_clf
-
-            # --- Final Combined Loss ---
+                inst_loc = self.force_directed_loss(feat_loc, labels_loc_down)
+                inst_clf = self.force_directed_loss(feat_clf, labels_clf_down)
+                inst_loss = self.args.alpha * inst_loc + self.args.beta * inst_clf
+                    
             final_loss = bda_loss + inst_loss
 
-            # ====================================
-            # === Backward + Optimization Stage ===
-            # ====================================
-
-            # Scale the loss before backward pass (AMP)
             self.scaler.scale(final_loss).backward()
-
-            # Unscale gradients before clipping
             self.scaler.unscale_(self.optim)
-
-            # Gradient clipping (safety for large updates)
             torch.nn.utils.clip_grad_norm_(self.deep_model.parameters(), 1.0)
-
-            # Step optimizer
             self.scaler.step(self.optim)
             self.scaler.update()
 
@@ -217,6 +229,8 @@ class Trainer(object):
             self.bda_losses.append(bda_loss.item())
             self.inst_losses.append(inst_loss.item())
             self.final_losses.append(final_loss.item())
+            self.inst_loc_losses_unweighted.append(inst_loc.item())
+            self.inst_clf_losses_unweighted.append(inst_clf.item())
 
             progress_bar.set_postfix({
                 'BDA': f'{bda_loss.item():.4f}',
@@ -348,15 +362,13 @@ class Trainer(object):
         return loc_f1_score, harmonic_mean_f1, final_OA, mIoU, IoU_of_each_class
 
     def plot_losses(self):
-        # Ensure model_save_path exists for saving plots
         if not os.path.exists(self.model_save_path):
             os.makedirs(self.model_save_path)
 
-        # Plot 1: Main losses (BDA, Instance, Total)
         plt.figure(figsize=(12, 6))
         plt.plot(self.iterations, self.final_losses, label='Total Loss', color='red', alpha=0.8)
-        plt.plot(self.iterations, self.bda_losses, label='BDA Loss', color='blue', alpha=0.8)
-        plt.plot(self.iterations, self.inst_losses, label=f'Instance Consistency Loss (Weighted, alpha={self.args.alpha}, beta={self.args.beta})', color='green', alpha=0.8)
+        plt.plot(self.iterations, self.bda_losses, label='BDA Loss (w/ Boundary Weight)', color='blue', alpha=0.8)
+        plt.plot(self.iterations, self.inst_losses, label=f'Spatially Aware Force Loss (Weighted)', color='green', alpha=0.8)
         plt.xlabel('Iteration')
         plt.ylabel('Loss Value')
         plt.title('Training Losses Over Iterations')
@@ -366,22 +378,19 @@ class Trainer(object):
         plot_path_main = os.path.join(self.model_save_path, 'training_losses_main.png')
         plt.savefig(plot_path_main)
         print(f"Main loss plot saved to {plot_path_main}")
-        # plt.show() # Uncomment to display plot during execution
-
-        # Plot 2: Unweighted Instance Consistency Losses
+        
         plt.figure(figsize=(12, 6))
-        plt.plot(self.iterations, self.inst_loc_losses_unweighted, label='Instance Localization Loss (Unweighted)', color='purple', alpha=0.8)
-        plt.plot(self.iterations, self.inst_clf_losses_unweighted, label='Instance Classification Loss (Unweighted)', color='orange', alpha=0.8)
+        plt.plot(self.iterations, self.inst_loc_losses_unweighted, label='Spatially Aware Loc Loss (Unweighted)', color='purple', alpha=0.8)
+        plt.plot(self.iterations, self.inst_clf_losses_unweighted, label='Spatially Aware Clf Loss (Unweighted)', color='orange', alpha=0.8)
         plt.xlabel('Iteration')
         plt.ylabel('Loss Value')
-        plt.title('Unweighted Instance Consistency Losses Over Iterations')
+        plt.title('Unweighted Spatially Aware Losses Over Iterations')
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
         plot_path_inst = os.path.join(self.model_save_path, 'training_losses_instance_unweighted.png')
         plt.savefig(plot_path_inst)
         print(f"Unweighted instance loss plot saved to {plot_path_inst}")
-        # plt.show() # Uncomment to display plot during execution
 
 def main():
     parser = argparse.ArgumentParser(description="Training on xBD dataset")
@@ -415,6 +424,12 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.5, help="Weight for the localization component of the force-directed loss.")
     parser.add_argument('--beta', type=float, default=0.5, help="Weight for the classification component of the force-directed loss.")
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    
+    # --- Arguments for Spatially Aware Force-Directed Loss ---
+    parser.add_argument('--repulsion_margin', type=float, default=2.0, help='Margin for inter-instance repulsion loss in feature space.')
+    parser.add_argument('--weight_attraction', type=float, default=1.0, help='Weight for the attraction component of the instance loss.')
+    parser.add_argument('--weight_repulsion', type=float, default=1.0, help='Weight for the repulsion component of the instance loss.')
+    parser.add_argument('--spatial_sigma', type=float, default=50.0, help='Controls the falloff of the spatial weight for repulsion.')
     
     args = parser.parse_args()
 

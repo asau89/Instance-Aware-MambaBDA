@@ -1,6 +1,4 @@
 import numpy as np
-
-
 class Evaluator(object):
     def __init__(self, num_class):
         self.num_class = num_class
@@ -31,8 +29,7 @@ class Evaluator(object):
         Pre = self.Pixel_Precision_Rate()
         F1 = 2 * Rec * Pre / (Rec + Pre)
         return F1
-
-
+    
     def calculate_per_class_metrics(self):
         # Adjustments to exclude class 0 in calculations
         TPs = np.diag(self.confusion_matrix)[1:]  # Start from index 1 to exclude class 0
@@ -40,7 +37,7 @@ class Evaluator(object):
         FPs = np.sum(self.confusion_matrix, axis=0)[1:] - TPs
         return TPs, FNs, FPs
     
-    def Damage_F1_socore(self):
+    def Damage_F1_score(self):
         TPs, FNs, FPs = self.calculate_per_class_metrics()
         precisions = TPs / (TPs + FPs + 1e-7)
         recalls = TPs / (TPs + FNs + 1e-7)

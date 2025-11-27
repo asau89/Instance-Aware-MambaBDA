@@ -1,16 +1,17 @@
 import torch
-from .Mamba_backbone import Backbone_VSSM
-from classification.models.vmamba import VSSM, LayerNorm2d, VSSBlock, Permute
+from MambaCD.changedetection.models.Mamba_backbone import Backbone_VSSM
+from MambaCD.classification.models.vmamba import VSSM, LayerNorm2d, VSSBlock, Permute
 
 import torch.nn as nn
 import torch.nn.functional as F
-from .ChangeDecoder_BRIGHT import ChangeDecoder
-from .SemanticDecoder import SemanticDecoder
+from MambaCD.changedetection.models.ChangeDecoder_BRIGHT import ChangeDecoder
+from MambaCD.changedetection.models.SemanticDecoder import SemanticDecoder
 
 
 class ChangeMambaMMBDA(nn.Module):
     def __init__(self, output_building, output_damage, pretrained, **kwargs):
         super(ChangeMambaMMBDA, self).__init__()
+        # Using two separate encoders for multimodal data (e.g., Optical + SAR)
         self.encoder_1 = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **kwargs)
         self.encoder_2 = Backbone_VSSM(out_indices=(0, 1, 2, 3), pretrained=pretrained, **kwargs)
        
@@ -29,7 +30,7 @@ class ChangeMambaMMBDA(nn.Module):
 
         self.channel_first = self.encoder_1.channel_first
 
-        print(self.channel_first)
+        print(f"ChangeMambaMMBDA initialized with channel_first={self.channel_first}")
 
         norm_layer: nn.Module = _NORMLAYERS.get(kwargs['norm_layer'].lower(), None)        
         ssm_act_layer: nn.Module = _ACTLAYERS.get(kwargs['ssm_act_layer'].lower(), None)
@@ -46,7 +47,6 @@ class ChangeMambaMMBDA(nn.Module):
             **clean_kwargs
         )
 
-        # We only use one kind of spatio-temporal modelling mechanism here
         self.decoder_damage = ChangeDecoder(
             encoder_dims=self.encoder_2.dims,
             channel_first=self.encoder_2.channel_first,
@@ -68,14 +68,20 @@ class ChangeMambaMMBDA(nn.Module):
         pre_features = self.encoder_1(pre_data)
         post_features = self.encoder_2(post_data)
 
-        # Decoder processing - passing encoder outputs to the decoder
-        output_building = self.decoder_building(pre_features)
-        output_damage = self.decoder_damage(pre_features, post_features)
+        # Decoder processing - these are the intermediate features we need
+        features_building = self.decoder_building(pre_features)
+        features_damage = self.decoder_damage(pre_features, post_features)
        
-        output_building = self.aux_clf(output_building)
-        output_building = F.interpolate(output_building, size=pre_data.size()[-2:], mode='bilinear')
+        # Final predictions
+        pred_building = self.aux_clf(features_building)
+        pred_building = F.interpolate(pred_building, size=pre_data.size()[-2:], mode='bilinear')
 
-        output_damage = self.main_clf(output_damage)
-        output_damage = F.interpolate(output_damage, size=post_data.size()[-2:], mode='bilinear')
+        pred_damage = self.main_clf(features_damage)
+        pred_damage = F.interpolate(pred_damage, size=post_data.size()[-2:], mode='bilinear')
        
-        return output_building, output_damage
+        # During training, return intermediate features for the consistency loss
+        if self.training:
+            return pred_building, pred_damage, features_building, features_damage
+        else:
+            # During evaluation/inference, return only the final predictions
+            return pred_building, pred_damage

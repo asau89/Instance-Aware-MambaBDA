@@ -1,7 +1,7 @@
 import random
 import numpy as np
 from PIL import Image
-# from scipy import misc
+# from scipy import misc # This import was commented out, keeping it that way
 import torch
 import torchvision
 
@@ -9,12 +9,21 @@ from PIL import ImageEnhance
 
 
 def normalize_img(img, mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375]):
-    """Normalize image by subtracting mean and dividing by std."""
-    img_array = np.asarray(img)
-    normalized_img = np.empty_like(img_array, np.float32)
+    """
+    Normalize image by subtracting mean and dividing by std.
+    Ensures image is np.float32 to prevent implicit float64 conversion during calculations.
+    """
+    # CRITICAL CHANGE: Ensure the input image array is float32 for consistent calculations.
+    # This prevents NumPy from implicitly converting to float64 during arithmetic operations,
+    # which can interfere with PyTorch's Automatic Mixed Precision (AMP).
+    img_array = np.asarray(img, dtype=np.float32)
+    
+    # Ensure mean and std are also float32 NumPy arrays
+    mean_np = np.array(mean, dtype=np.float32)
+    std_np = np.array(std, dtype=np.float32)
 
-    for i in range(3):  # Loop over color channels
-        normalized_img[..., i] = (img_array[..., i] - mean[i]) / std[i]
+    # Perform normalization directly on the float32 array
+    normalized_img = (img_array - mean_np) / std_np
     
     return normalized_img
 
@@ -78,7 +87,7 @@ def random_flipud_mcd(pre_img, post_img, label_cd, label_1, label_2):
 
 
 def random_rot(pre_img, post_img, label):
-    k = random.randrange(3) + 1
+    k = random.randrange(3) + 1 # Generates 1, 2, or 3 (for 90, 180, 270 degrees)
 
     pre_img = np.rot90(pre_img, k).copy()
     post_img = np.rot90(post_img, k).copy()
@@ -110,42 +119,49 @@ def random_rot_mcd(pre_img, post_img, label_cd, label_1, label_2):
     return pre_img, post_img, label_cd, label_1, label_2
 
 
+# NOTE: random_crop and random_bi_image_crop seem to be unused in your MultimodalDamageAssessmentDatset,
+# but I'm including them with potential dtype fixes for completeness.
 def random_crop(img, crop_size, mean_rgb=[0, 0, 0], ignore_index=255):
     h, w, _ = img.shape
 
     H = max(crop_size, h)
     W = max(crop_size, w)
 
-    pad_image = np.zeros((H, W, 3), dtype=np.float32)
+    # Use img.dtype for pixel data, assuming it's already float32 from normalize_img or uint8
+    pad_image = np.zeros((H, W, 3), dtype=img.dtype) # Use original img dtype
+    
+    # Fill padding with mean values (these should be float32)
+    mean_np = np.array(mean_rgb, dtype=np.float32)
+    pad_image[:, :, 0] = mean_np[0]
+    pad_image[:, :, 1] = mean_np[1]
+    pad_image[:, :, 2] = mean_np[2]
 
-    pad_image[:, :, 0] = mean_rgb[0]
-    pad_image[:, :, 1] = mean_rgb[1]
-    pad_image[:, :, 2] = mean_rgb[2]
+    H_pad = int(np.random.randint(0, H - h + 1))
+    W_pad = int(np.random.randint(0, W - w + 1))
 
-    H_pad = int(np.random.randint(H - h + 1))
-    W_pad = int(np.random.randint(W - w + 1))
-
-    pad_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = pad_image
+    pad_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = img # Assign original img
 
     def get_random_cropbox(cat_max_ratio=0.75):
-
+        # NOTE: This cropping logic uses pad_image[..., 0] as a 'temp_label'.
+        # If pad_image is image data (float32), unique values for unique_classes 
+        # for segmentation labels. It should probably use an actual label.
+        # This function might be intended for a different use case or needs a label input.
         for i in range(10):
-
             H_start = random.randrange(0, H - crop_size + 1, 1)
             H_end = H_start + crop_size
             W_start = random.randrange(0, W - crop_size + 1, 1)
             W_end = W_start + crop_size
 
-            temp_label = pad_image[H_start:H_end, W_start:W_end, 0]
+            temp_label = pad_image[H_start:H_end, W_start:W_end, 0] # This is likely image channel data, not label
             index, cnt = np.unique(temp_label, return_counts=True)
-            cnt = cnt[index != ignore_index]
-            if len(cnt > 1) and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
+            # The condition 'len(cnt > 1)' can be problematic if cnt is empty or has one element.
+            # Should be 'len(cnt) > 1'
+            if len(cnt) > 1 and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
                 break
 
         return H_start, H_end, W_start, W_end,
 
     H_start, H_end, W_start, W_end = get_random_cropbox()
-    # print(W_start)
 
     img = pad_image[H_start:H_end, W_start:W_end, :]
 
@@ -153,7 +169,9 @@ def random_crop(img, crop_size, mean_rgb=[0, 0, 0], ignore_index=255):
 
 
 def random_bi_image_crop(pre_img, object, crop_size, mean_rgb=[0, 0, 0], ignore_index=255):
-    h, w = object.shape
+    # NOTE: This function's `object` argument seems to be a label.
+    # It doesn't perform padding, assumes object and pre_img are large enough.
+    h, w = object.shape # Assumes object is 2D (label)
 
     H = max(crop_size, h)
     W = max(crop_size, w)
@@ -163,15 +181,9 @@ def random_bi_image_crop(pre_img, object, crop_size, mean_rgb=[0, 0, 0], ignore_
     W_start = random.randrange(0, W - crop_size + 1, 1)
     W_end = W_start + crop_size
 
-    # H_start, H_end, W_start, W_end = get_random_cropbox()
-    # print(W_start)
-
     pre_img = pre_img[H_start:H_end, W_start:W_end, :]
-    # post_img = post_img[H_start:H_end, W_start:W_end, :]
-    object = object[H_start:H_end, W_start:W_end]
-    # cmap = colormap()
-    # misc.imsave('cropimg.png',image/255)
-    # misc.imsave('croplabel.png',encode_cmap(GT))
+    object = object[H_start:H_end, W_start:W_end] # crop label (object)
+    
     return pre_img, object
 
 
@@ -181,31 +193,32 @@ def random_crop_new(pre_img, post_img, label, crop_size, mean_rgb=[0, 0, 0], ign
     H = max(crop_size, h)
     W = max(crop_size, w)
 
-    pad_pre_image = np.zeros((H, W, 3), dtype=np.float32)
+    # Use pre_img.dtype as reference for image padding, assuming it's already float32
+    pad_pre_image = np.zeros((H, W, 3), dtype=pre_img.dtype)
+    pad_post_image = np.zeros((H, W, 3), dtype=post_img.dtype)
+    
+    # CRITICAL CHANGE for labels: Use uint8 for labels, filled with ignore_index
+    pad_label = np.full((H, W), ignore_index, dtype=np.uint8) # Use np.full for clearer intent
 
-    pad_post_image = np.zeros((H, W, 3), dtype=np.float32)
-    pad_label = np.ones((H, W), dtype=np.float32) * ignore_index
+    # Fill padding with mean values (these should be float32)
+    mean_np = np.array(mean_rgb, dtype=np.float32)
+    pad_pre_image[:, :, 0] = mean_np[0]
+    pad_pre_image[:, :, 1] = mean_np[1]
+    pad_pre_image[:, :, 2] = mean_np[2]
 
-    # pad_pre_image[:, :] = mean_rgb[0]
-    pad_pre_image[:, :, 0] = mean_rgb[0]
-    pad_pre_image[:, :, 1] = mean_rgb[1]
-    pad_pre_image[:, :, 2] = mean_rgb[2]
+    pad_post_image[:, :, 0] = mean_np[0]
+    pad_post_image[:, :, 1] = mean_np[1]
+    pad_post_image[:, :, 2] = mean_np[2]
 
-    pad_post_image[:, :, 0] = mean_rgb[0]
-    pad_post_image[:, :, 1] = mean_rgb[1]
-    pad_post_image[:, :, 2] = mean_rgb[2]
-
-    H_pad = int(np.random.randint(H - h + 1))
-    W_pad = int(np.random.randint(W - w + 1))
+    H_pad = int(np.random.randint(0, H - h + 1))
+    W_pad = int(np.random.randint(0, W - w + 1))
 
     pad_pre_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = pre_img
     pad_post_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = post_img
     pad_label[H_pad:(H_pad + h), W_pad:(W_pad + w)] = label
 
     def get_random_cropbox(cat_max_ratio=0.75):
-
         for i in range(10):
-
             H_start = random.randrange(0, H - crop_size + 1, 1)
             H_end = H_start + crop_size
             W_start = random.randrange(0, W - crop_size + 1, 1)
@@ -214,13 +227,13 @@ def random_crop_new(pre_img, post_img, label, crop_size, mean_rgb=[0, 0, 0], ign
             temp_label = pad_label[H_start:H_end, W_start:W_end]
             index, cnt = np.unique(temp_label, return_counts=True)
             cnt = cnt[index != ignore_index]
-            if len(cnt > 1) and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
+            # Fixed len(cnt > 1) -> len(cnt) > 1
+            if len(cnt) > 1 and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
                 break
 
         return H_start, H_end, W_start, W_end,
 
     H_start, H_end, W_start, W_end = get_random_cropbox()
-    # print(W_start)
     pre_img = pad_pre_image[H_start:H_end, W_start:W_end, :]
     post_img = pad_post_image[H_start:H_end, W_start:W_end, :]
     label = pad_label[H_start:H_end, W_start:W_end]
@@ -234,23 +247,26 @@ def random_crop_bda(pre_img, post_img, loc_label, clf_label, crop_size, mean_rgb
     H = max(crop_size, h)
     W = max(crop_size, w)
 
-    pad_pre_image = np.zeros((H, W, 3), dtype=np.float32)
+    # Use pre_img.dtype as reference for image padding, assuming it's already float32
+    pad_pre_image = np.zeros((H, W, 3), dtype=pre_img.dtype)
+    pad_post_image = np.zeros((H, W, 3), dtype=post_img.dtype)
+    
+    # CRITICAL CHANGE for labels: Use uint8 for labels
+    pad_loc_label = np.full((H, W), ignore_index, dtype=np.uint8)
+    pad_clf_label = np.full((H, W), ignore_index, dtype=np.uint8)
 
-    pad_post_image = np.zeros((H, W, 3), dtype=np.float32)
-    pad_loc_label = np.ones((H, W), dtype=np.float32) * ignore_index
-    pad_clf_label = np.ones((H, W), dtype=np.float32) * ignore_index
+    # Fill padding with mean values (these should be float32)
+    mean_np = np.array(mean_rgb, dtype=np.float32)
+    pad_pre_image[:, :, 0] = mean_np[0]
+    pad_pre_image[:, :, 1] = mean_np[1]
+    pad_pre_image[:, :, 2] = mean_np[2]
 
-    # pad_pre_image[:, :] = mean_rgb[0]
-    pad_pre_image[:, :, 0] = mean_rgb[0]
-    pad_pre_image[:, :, 1] = mean_rgb[1]
-    pad_pre_image[:, :, 2] = mean_rgb[2]
+    pad_post_image[:, :, 0] = mean_np[0]
+    pad_post_image[:, :, 1] = mean_np[1]
+    pad_post_image[:, :, 2] = mean_np[2]
 
-    pad_post_image[:, :, 0] = mean_rgb[0]
-    pad_post_image[:, :, 1] = mean_rgb[1]
-    pad_post_image[:, :, 2] = mean_rgb[2]
-
-    H_pad = int(np.random.randint(H - h + 1))
-    W_pad = int(np.random.randint(W - w + 1))
+    H_pad = int(np.random.randint(0, H - h + 1))
+    W_pad = int(np.random.randint(0, W - w + 1))
 
     pad_pre_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = pre_img
     pad_post_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = post_img
@@ -258,9 +274,7 @@ def random_crop_bda(pre_img, post_img, loc_label, clf_label, crop_size, mean_rgb
     pad_clf_label[H_pad:(H_pad + h), W_pad:(W_pad + w)] = clf_label
 
     def get_random_cropbox(cat_max_ratio=0.75):
-
         for i in range(10):
-
             H_start = random.randrange(0, H - crop_size + 1, 1)
             H_end = H_start + crop_size
             W_start = random.randrange(0, W - crop_size + 1, 1)
@@ -269,13 +283,13 @@ def random_crop_bda(pre_img, post_img, loc_label, clf_label, crop_size, mean_rgb
             temp_label = pad_loc_label[H_start:H_end, W_start:W_end]
             index, cnt = np.unique(temp_label, return_counts=True)
             cnt = cnt[index != ignore_index]
-            if len(cnt > 1) and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
+            # Fixed len(cnt > 1) -> len(cnt) > 1
+            if len(cnt) > 1 and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
                 break
 
         return H_start, H_end, W_start, W_end,
 
     H_start, H_end, W_start, W_end = get_random_cropbox()
-    # print(W_start)
     pre_img = pad_pre_image[H_start:H_end, W_start:W_end, :]
     post_img = pad_post_image[H_start:H_end, W_start:W_end, :]
     loc_label = pad_loc_label[H_start:H_end, W_start:W_end]
@@ -290,24 +304,27 @@ def random_crop_mcd(pre_img, post_img, label_cd, label_1, label_2, crop_size, me
     H = max(crop_size, h)
     W = max(crop_size, w)
 
-    pad_pre_image = np.zeros((H, W, 3), dtype=np.float32)
+    # Use pre_img.dtype as reference for image padding, assuming it's already float32
+    pad_pre_image = np.zeros((H, W, 3), dtype=pre_img.dtype)
+    pad_post_image = np.zeros((H, W, 3), dtype=post_img.dtype)
+    
+    # CRITICAL CHANGE for labels: Use uint8 for labels
+    pad_label_cd = np.full((H, W), ignore_index, dtype=np.uint8)
+    pad_label_1 = np.full((H, W), ignore_index, dtype=np.uint8)
+    pad_label_2 = np.full((H, W), ignore_index, dtype=np.uint8)
 
-    pad_post_image = np.zeros((H, W, 3), dtype=np.float32)
-    pad_label_cd = np.ones((H, W), dtype=np.float32) * ignore_index
-    pad_label_1 = np.ones((H, W), dtype=np.float32) * ignore_index
-    pad_label_2 = np.ones((H, W), dtype=np.float32) * ignore_index
+    # Fill padding with mean values (these should be float32)
+    mean_np = np.array(mean_rgb, dtype=np.float32)
+    pad_pre_image[:, :, 0] = mean_np[0]
+    pad_pre_image[:, :, 1] = mean_np[1]
+    pad_pre_image[:, :, 2] = mean_np[2]
 
-    # pad_pre_image[:, :] = mean_rgb[0]
-    pad_pre_image[:, :, 0] = mean_rgb[0]
-    pad_pre_image[:, :, 1] = mean_rgb[1]
-    pad_pre_image[:, :, 2] = mean_rgb[2]
+    pad_post_image[:, :, 0] = mean_np[0]
+    pad_post_image[:, :, 1] = mean_np[1]
+    pad_post_image[:, :, 2] = mean_np[2]
 
-    pad_post_image[:, :, 0] = mean_rgb[0]
-    pad_post_image[:, :, 1] = mean_rgb[1]
-    pad_post_image[:, :, 2] = mean_rgb[2]
-
-    H_pad = int(np.random.randint(H - h + 1))
-    W_pad = int(np.random.randint(W - w + 1))
+    H_pad = int(np.random.randint(0, H - h + 1))
+    W_pad = int(np.random.randint(0, W - w + 1))
 
     pad_pre_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = pre_img
     pad_post_image[H_pad:(H_pad + h), W_pad:(W_pad + w), :] = post_img
@@ -317,9 +334,7 @@ def random_crop_mcd(pre_img, post_img, label_cd, label_1, label_2, crop_size, me
     pad_label_2[H_pad:(H_pad + h), W_pad:(W_pad + w)] = label_2
 
     def get_random_cropbox(cat_max_ratio=0.75):
-
         for i in range(10):
-
             H_start = random.randrange(0, H - crop_size + 1, 1)
             H_end = H_start + crop_size
             W_start = random.randrange(0, W - crop_size + 1, 1)
@@ -328,13 +343,13 @@ def random_crop_mcd(pre_img, post_img, label_cd, label_1, label_2, crop_size, me
             temp_label = pad_label_1[H_start:H_end, W_start:W_end]
             index, cnt = np.unique(temp_label, return_counts=True)
             cnt = cnt[index != ignore_index]
-            if len(cnt > 1) and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
+            # Fixed len(cnt > 1) -> len(cnt) > 1
+            if len(cnt) > 1 and np.max(cnt) / np.sum(cnt) < cat_max_ratio:
                 break
 
         return H_start, H_end, W_start, W_end,
 
     H_start, H_end, W_start, W_end = get_random_cropbox()
-    # print(W_start)
     pre_img = pad_pre_image[H_start:H_end, W_start:W_end, :]
     post_img = pad_post_image[H_start:H_end, W_start:W_end, :]
     label_cd = pad_label_cd[H_start:H_end, W_start:W_end]
@@ -342,3 +357,13 @@ def random_crop_mcd(pre_img, post_img, label_cd, label_1, label_2, crop_size, me
     label_2 = pad_label_2[H_start:H_end, W_start:W_end]
 
     return pre_img, post_img, label_cd, label_1, label_2
+
+# Placeholder for img_loader, assuming it's part of this imutils or provided externally
+# If img_loader is intended to be part of imutils, you need to define its actual loading logic here.
+# For example, using OpenCV:
+# import cv2
+# def img_loader(path):
+#     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+#     if img is None:
+#         raise FileNotFoundError(f"Image not found at {path}")
+#     return img

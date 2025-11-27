@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train ChangeMamba",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/changedetection/script/train_MambaBDA_bright.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--train_data_list_path", "/path/to/your/train_list.txt",
+                "--val_data_list_path", "/path/to/your/validation_list.txt",
+                "--dataset_path", "/path/to/your/dataset_root_folder/",
+                "--save_path", "./checkpoints/MambaBDA_bright_model"
+                // Add any other required arguments here, each on its own line
+                // For example:
+                // "--batch_size", "8",
+                // "--epochs", "100"
+            ]
+        }
+    ]
+}

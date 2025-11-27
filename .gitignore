@@ -49,3 +49,13 @@ kernels/selective_scan/test_selective_scan_speed.py
 kernels/selective_scan/test_selective_scan_easy.py
 kernels/selective_scan/ssmtriton.py
 test.sh
+
+# User requested ignores
+results*/
+MODEL OUTPUTS/
+labels/
+dataset/
+compiled_pdfs/
+changedetection/checkpoints/
+changedetection/saved_models/
+pretrained_weight/
