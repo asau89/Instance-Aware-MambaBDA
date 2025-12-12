@@ -391,7 +391,7 @@ This project is based on VMamba ([paper](https://arxiv.org/abs/2401.10166), [cod
 
 
 
-# BRIGHT Quick Guide (ChangeMamba BDA)
+# BRIGHT Quick Guide (Instance Aware MambaBDA)
 
 This note is tailored to the BRIGHT/xBD-style building damage assessment workflow using the slim scripts in this folder.
 
