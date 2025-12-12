@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from changedetection.models.Mamba_backbone import Backbone_VSSM
-from classification.models.vmamba import LayerNorm2d
+from ...classification.models.vmamba import LayerNorm2d
 from changedetection.models.ChangeDecoder_BRIGHT import ChangeDecoder
 from changedetection.models.SemanticDecoder import SemanticDecoder
 

@@ -1,13 +1,15 @@
+# train_MambaBDA_bright.py
+
 import sys
-# Make sure the project root is in the path. Adjust if your project root is different.
+# Add your project root (adjust if your structure differs)
 sys.path.append('/home/granbell')
 
 import argparse
 import os
 import time
-
+import random
 import numpy as np
-import matplotlib.pyplot as plt # Import matplotlib for plotting
+import matplotlib.pyplot as plt
 
 from MambaCD.changedetection.configs.config import get_config
 
@@ -17,34 +19,69 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from scipy.ndimage import sobel
+
 from MambaCD.changedetection.datasets.make_data_loader import make_data_loader, MultimodalDamageAssessmentDatset
 from MambaCD.changedetection.utils_func.metrics import Evaluator
-from MambaCD.changedetection.models.ChangeMambaMMBDA import ChangeMambaMMBDA
-
+from MambaCD.changedetection.models.ChangeMambaMMBDA_ForceDirected import ChangeMambaMMBDA
 import MambaCD.changedetection.utils_func.lovasz_loss as L
-# Import our new loss function
-from MambaCD.changedetection.utils_func.instance_consistency_loss import InstanceConsistencyLoss
-
-# Import AMP
+# Import the new, spatially aware loss function
+from MambaCD.changedetection.utils_func.instance_consistency_loss_forcedirected import InstanceConsistencyLoss
 from torch.cuda.amp import autocast, GradScaler
 
+
+# ============================================================
+# ✅ 1. GLOBAL SEED FUNCTION
+# ============================================================
+def set_seed(seed: int = 42):
+    """
+    Ensures full reproducibility across:
+    - Python random
+    - NumPy
+    - PyTorch (CPU & GPU)
+    - cuDNN backend
+    """
+    print(f"Setting all random seeds to: {seed}")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU
+
+    # Enforce deterministic operations (may slightly reduce performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Optional: for deterministic dataloader workers
+    def seed_worker(worker_id):
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return seed_worker
+
+
+# ============================================================
+# ✅ 2. TRAINER CLASS
+# ============================================================
 class Trainer(object):
     def __init__(self, args):
         self.args = args
         config = get_config(args)
 
-        self.train_data_loader = make_data_loader(args)
+        # Set up data loader with seeded workers for deterministic shuffling
+        worker_init_fn = set_seed(args.seed)
+        self.train_data_loader = make_data_loader(args, worker_init_fn=worker_init_fn)
 
+        # Evaluators for localization, classification, and total metrics
         self.evaluator_loc = Evaluator(num_class=2)
         self.evaluator_clf = Evaluator(num_class=4)
         self.evaluator_total = Evaluator(num_class=4)
 
-        # Instantiate the instance consistency loss with separation parameters
-        self.inst_consistency_loss = InstanceConsistencyLoss(
-            separation_margin=args.separation_margin,
-            separation_weight=args.separation_weight
-        )
-
+    
+        # Instance Consistency Loss Initialization
+        self.inst_consistency_loss = InstanceConsistencyLoss()
+        # Initialize model
         self.deep_model = ChangeMambaMMBDA(
             output_building=2, output_damage=4,
             pretrained=args.pretrained_weight_path,
@@ -53,7 +90,6 @@ class Trainer(object):
             num_classes=config.MODEL.NUM_CLASSES,
             depths=config.MODEL.VSSM.DEPTHS,
             dims=config.MODEL.VSSM.EMBED_DIM,
-            # ===================
             ssm_d_state=config.MODEL.VSSM.SSM_D_STATE,
             ssm_ratio=config.MODEL.VSSM.SSM_RATIO,
             ssm_rank_ratio=config.MODEL.VSSM.SSM_RANK_RATIO,
@@ -64,11 +100,9 @@ class Trainer(object):
             ssm_drop_rate=config.MODEL.VSSM.SSM_DROP_RATE,
             ssm_init=config.MODEL.VSSM.SSM_INIT,
             forward_type=config.MODEL.VSSM.SSM_FORWARDTYPE,
-            # ===================
             mlp_ratio=config.MODEL.VSSM.MLP_RATIO,
             mlp_act_layer=config.MODEL.VSSM.MLP_ACT_LAYER,
             mlp_drop_rate=config.MODEL.VSSM.MLP_DROP_RATE,
-            # ===================
             drop_path_rate=config.MODEL.DROP_PATH_RATE,
             patch_norm=config.MODEL.VSSM.PATCH_NORM,
             norm_layer=config.MODEL.VSSM.NORM_LAYER,
@@ -76,45 +110,35 @@ class Trainer(object):
             patchembed_version=config.MODEL.VSSM.PATCHEMBED,
             gmlp=config.MODEL.VSSM.GMLP,
             use_checkpoint=config.TRAIN.USE_CHECKPOINT,
-        )
+        ).cuda()
 
-        self.deep_model = self.deep_model.cuda()
         self.model_save_path = os.path.join(args.model_param_path, args.dataset,
                                             args.model_type + '_' + str(time.time()))
-        self.lr = args.learning_rate
-
         if not os.path.exists(self.model_save_path):
             os.makedirs(self.model_save_path)
 
+        # Resume checkpoint
         if args.resume is not None:
             if not os.path.isfile(args.resume):
-                raise RuntimeError("=> no checkpoint found at '{}'".format(args.resume))
-            print(f"Resuming training from checkpoint: {args.resume}")
+                raise RuntimeError(f"=> no checkpoint found at '{args.resume}'")
+            print(f"Resuming from checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume)
-            # Adjust to load from a raw state_dict or a checkpoint dictionary
-            state_dict_to_load = checkpoint['model'] if 'model' in checkpoint else checkpoint
-            self.deep_model.load_state_dict(state_dict_to_load, strict=False)
+            state_dict = checkpoint['model'] if 'model' in checkpoint else checkpoint
+            self.deep_model.load_state_dict(state_dict, strict=False)
 
         self.optim = optim.AdamW(self.deep_model.parameters(),
                                  lr=args.learning_rate,
                                  weight_decay=args.weight_decay)
-
-        # Initialize the GradScaler for FP16 training
         self.scaler = GradScaler()
 
-        # Initialize lists to record losses for plotting
+        # Lists for plotting losses
         self.iterations = []
-        self.bda_losses = []
-        self.inst_combined_losses = [] # Combined weighted instance loss (alpha * total_loc_inst_loss + beta * total_clf_inst_loss)
-        self.final_losses = []
-        
-        # New lists for unweighted components of instance loss for detailed plotting
-        self.inst_loc_consistency_losses_unweighted = [] 
-        self.inst_clf_consistency_losses_unweighted = [] 
-        self.inst_loc_separation_losses_unweighted = []
-        self.inst_clf_separation_losses_unweighted = []
+        self.bda_losses, self.inst_losses, self.final_losses = [], [], []
 
 
+    # ============================================================
+    # ✅ 3. TRAINING LOOP
+    # ============================================================
     def training(self):
         best_mIoU = 0.0
         best_round = []
@@ -137,12 +161,16 @@ class Trainer(object):
             if not valid_labels_clf:
                continue
 
-            self.optim.zero_grad()
+           # ==============================
+            # === Forward + Loss Section ===
+            # ==============================
+            self.optim.zero_grad(set_to_none=True)
 
-            # Use autocast for mixed precision training
-            with autocast():
-                # The model now returns 4 tensors during training
-                pred_loc, pred_clf, features_loc, features_clf = self.deep_model(pre_change_imgs, post_change_imgs)
+            # ---------------- AMP Forward Pass ----------------
+            with autocast(enabled=True):
+                pred_loc, pred_clf, features_loc, features_clf, features_loc_hr, features_clf_hr = self.deep_model(
+                    pre_change_imgs, post_change_imgs
+                )
 
                 # --- Standard BDA Losses ---
                 ce_loss_loc = F.cross_entropy(pred_loc, labels_loc, ignore_index=255)
@@ -153,77 +181,80 @@ class Trainer(object):
 
                 bda_loss = (ce_loss_loc + 0.5 * lovasz_loss_loc) + (ce_loss_clf + 0.75 * lovasz_loss_clf)
 
-                feature_map_size = features_loc.shape[-2:] # H, W of the feature map
+            # ---------------- FP32 Instance Loss ----------------
+            # Compute instance losses outside autocast to prevent underflow
+            feature_map_size_hr = features_loc_hr.shape[-2:]
+            labels_loc_down_hr = F.interpolate(labels_loc.unsqueeze(1).float(), size=feature_map_size_hr, mode='nearest').squeeze(1).long()
+            labels_clf_down_hr = F.interpolate(labels_clf.unsqueeze(1).float(), size=feature_map_size_hr, mode='nearest').squeeze(1).long()
 
-                # Use 'nearest' interpolation for labels to avoid creating new label values
-                labels_loc_down = F.interpolate(labels_loc.unsqueeze(1).float(),
-                                                size=feature_map_size, mode='nearest').squeeze(1).long()
-                labels_clf_down = F.interpolate(labels_clf.unsqueeze(1).float(),
-                                                size=feature_map_size, mode='nearest').squeeze(1).long()
+            loss_inst_loc = self.inst_consistency_loss(features_loc_hr.float(), labels_loc_down_hr)
+            loss_inst_clf = self.inst_consistency_loss(features_clf_hr.float(), labels_clf_down_hr)
 
-                # --- Instance Consistency & Separation Losses ---
-                # The loss function now returns (total_combined, consistency_only, separation_only)
-                total_inst_loc, inst_loc_consistency, inst_loc_separation = self.inst_consistency_loss(features_loc, labels_loc_down)
-                total_inst_clf, inst_clf_consistency, inst_clf_separation = self.inst_consistency_loss(features_clf, labels_clf_down)
+            inst_loss = self.args.alpha * loss_inst_loc + self.args.beta * loss_inst_clf
 
-                # 'inst_loss' here is the combined weighted instance loss (alpha*loc_total + beta*clf_total)
-                inst_combined_loss_weighted = self.args.alpha * total_inst_loc + self.args.beta * total_inst_clf
+            # --- Final Combined Loss ---
+            final_loss = bda_loss + inst_loss
 
-                # --- Combined Final Loss ---
-                final_loss = bda_loss + inst_combined_loss_weighted
+            # ====================================
+            # === Backward + Optimization Stage ===
+            # ====================================
 
-            # Scale the loss before backward pass
+            # Scale the loss before backward pass (AMP)
             self.scaler.scale(final_loss).backward()
 
-            # Unscale gradients before clipping, then step the optimizer
+            # Unscale gradients before clipping
             self.scaler.unscale_(self.optim)
-            torch.nn.utils.clip_grad_norm_(self.deep_model.parameters(), 1.0)
-            self.scaler.step(self.optim)
-            self.scaler.update() # Update the scaler for the next iteration
 
-            # Record losses for plotting
+            # Gradient clipping (safety for large updates)
+            torch.nn.utils.clip_grad_norm_(self.deep_model.parameters(), 1.0)
+
+            # Step optimizer
+            self.scaler.step(self.optim)
+            self.scaler.update()
+
+            # Logging
             self.iterations.append(itera + 1)
             self.bda_losses.append(bda_loss.item())
-            self.inst_combined_losses.append(inst_combined_loss_weighted.item()) # Combined weighted instance loss
+            self.inst_losses.append(inst_loss.item())
             self.final_losses.append(final_loss.item())
-            
-            # Record unweighted components for analysis/plotting
-            self.inst_loc_consistency_losses_unweighted.append(inst_loc_consistency.item())
-            self.inst_clf_consistency_losses_unweighted.append(inst_clf_consistency.item())
-            self.inst_loc_separation_losses_unweighted.append(inst_loc_separation.item())
-            self.inst_clf_separation_losses_unweighted.append(inst_clf_separation.item())
 
+            progress_bar.set_postfix({
+                'BDA': f'{bda_loss.item():.4f}',
+                'INST': f'{inst_loss.item():.4f}',
+                'TOTAL': f'{final_loss.item():.4f}'
+            })
 
-            # Update progress bar every iteration
-            if (itera + 1) % 1 == 0:
-                progress_bar.set_postfix({
-                    'BDA Loss': f'{bda_loss.item():.4f}',
-                    'Inst Combined': f'{inst_combined_loss_weighted.item():.4f}', # Now combined and weighted
-                    'Total Loss': f'{final_loss.item():.4f}',
-                    'Loc_Consist': f'{inst_loc_consistency.item():.4f}',
-                    'Clf_Consist': f'{inst_clf_consistency.item():.4f}',
-                    'Loc_Sep': f'{inst_loc_separation.item():.4f}',
-                    'Clf_Sep': f'{inst_clf_separation.item():.4f}'
-                })
-
+            # Periodic validation
             if (itera + 1) % 500 == 0:
                 self.deep_model.eval()
-                loc_f1_score_val, harmonic_mean_f1_val, final_OA_val, mIoU_val, IoU_of_each_class_val = self.validation()
+                loc_f1_val, clf_f1_val, oa_val, miou_val, iou_each_val = self.validation()
 
-                if mIoU_val > best_mIoU:
-                    loc_f1_score_test, harmonic_mean_f1_test, final_OA_test, mIoU_test, IoU_of_each_class_test = self.test()
-                    torch.save(self.deep_model.state_dict(), os.path.join(self.model_save_path, f'best_model.pth'))
-                    best_mIoU = mIoU_val
+                if miou_val > best_mIoU:
+                    loc_f1_test, clf_f1_test, oa_test, miou_test, iou_each_test = self.test()
+                    torch.save(self.deep_model.state_dict(),
+                               os.path.join(self.model_save_path, f'best_model.pth'))
+                    best_mIoU = miou_val
                     best_round = {
                         'best iter': itera + 1,
-                        'loc f1 (val)': loc_f1_score_val * 100, 'clf f1 (val)': harmonic_mean_f1_val * 100, 'OA (val)': final_OA_val * 100, 'mIoU (val)': mIoU_val * 100, 'sub class IoU (val)': IoU_of_each_class_val * 100,
-                        'loc f1 (test)': loc_f1_score_test * 100, 'clf f1 (test)': harmonic_mean_f1_test * 100, 'OA (test)': final_OA_test * 100, 'mIoU (test)': mIoU_test * 100, 'sub class IoU (test)': IoU_of_each_class_test * 100
+                        'loc f1 (val)': loc_f1_val * 100,
+                        'clf f1 (val)': clf_f1_val * 100,
+                        'OA (val)': oa_val * 100,
+                        'mIoU (val)': miou_val * 100,
+                        'sub class IoU (val)': iou_each_val * 100,
+                        'loc f1 (test)': loc_f1_test * 100,
+                        'clf f1 (test)': clf_f1_test * 100,
+                        'OA (test)': oa_test * 100,
+                        'mIoU (test)': miou_test * 100,
+                        'sub class IoU (test)': iou_each_test * 100
                     }
-                    print(f"\nNew best model saved at iteration {itera + 1} with validation mIoU: {mIoU_val*100:.2f}%")
-                    print(best_round)
+                    print('\n✅ New best round:')
+                    for k, v in best_round.items():
+                        print(f'{k}: {v}')
                 self.deep_model.train()
 
-        print('\nTraining finished. The accuracy of the best round is:\n', best_round)
+        print('\n🎯 Best Round Summary:')
+        for k, v in best_round.items():
+            print(f'{k}: {v}')
 
     def validation(self):
         print('---------starting validation-----------')
@@ -235,10 +266,7 @@ class Trainer(object):
         torch.cuda.empty_cache()
 
         with torch.no_grad():
-            # Wrap val_data_loader with tqdm and give it a description
             progress_bar = tqdm(val_data_loader, desc="Validating")
-
-            # Loop over the progress bar object
             for itera, data in enumerate(progress_bar):
                 pre_change_imgs, post_change_imgs, labels_loc, labels_clf, _ = data
 
@@ -247,13 +275,9 @@ class Trainer(object):
                 labels_loc = labels_loc.cuda().long()
                 labels_clf = labels_clf.cuda().long()
 
-                # Use autocast for mixed precision inference
                 with autocast():
                     output_loc, output_clf = self.deep_model(pre_change_imgs, post_change_imgs)
 
-                # Move results to CPU and convert to numpy for evaluation
-                # Note: output_loc and output_clf are likely float16 due to autocast,
-                # but argmax and subsequent processing don't strictly require FP32 conversion before moving to CPU.
                 output_loc = output_loc.data.cpu().numpy()
                 output_loc = np.argmax(output_loc, axis=1)
                 labels_loc = labels_loc.cpu().numpy()
@@ -263,11 +287,9 @@ class Trainer(object):
                 labels_clf = labels_clf.cpu().numpy()
 
                 self.evaluator_loc.add_batch(labels_loc, output_loc)
-
                 output_clf_damage_part = output_clf[labels_loc > 0]
                 labels_clf_damage_part = labels_clf[labels_loc > 0]
                 self.evaluator_clf.add_batch(labels_clf_damage_part, output_clf_damage_part)
-
                 self.evaluator_total.add_batch(labels_clf, output_clf)
 
         print("---------Validation loop finished-----------")
@@ -280,7 +302,6 @@ class Trainer(object):
         print(f'OA is {100 * final_OA}, mIoU is {100 * mIoU}, sub class IoU is {100 * IoU_of_each_class}')
         return loc_f1_score, harmonic_mean_f1, final_OA, mIoU, IoU_of_each_class
 
-
     def test(self):
         print('---------starting testing-----------')
         self.evaluator_loc.reset()
@@ -292,20 +313,16 @@ class Trainer(object):
 
         with torch.no_grad():
             progress_bar = tqdm(val_data_loader, desc="Testing")
-
             for data in progress_bar:
                 pre_change_imgs, post_change_imgs, labels_loc, labels_clf, _ = data
-
                 pre_change_imgs = pre_change_imgs.cuda()
                 post_change_imgs = post_change_imgs.cuda()
                 labels_loc = labels_loc.cuda().long()
                 labels_clf = labels_clf.cuda().long()
 
-                # Use autocast for mixed precision inference
                 with autocast():
                     output_loc, output_clf = self.deep_model(pre_change_imgs, post_change_imgs)
 
-                # Move results to CPU and convert to numpy for evaluation
                 output_loc = output_loc.data.cpu().numpy()
                 output_loc = np.argmax(output_loc, axis=1)
                 labels_loc = labels_loc.cpu().numpy()
@@ -315,12 +332,12 @@ class Trainer(object):
                 labels_clf = labels_clf.cpu().numpy()
 
                 self.evaluator_loc.add_batch(labels_loc, output_loc)
-
                 output_clf_damage_part = output_clf[labels_loc > 0]
                 labels_clf_damage_part = labels_clf[labels_loc > 0]
                 self.evaluator_clf.add_batch(labels_clf_damage_part, output_clf_damage_part)
-
                 self.evaluator_total.add_batch(labels_clf, output_clf)
+
+        print("---------Testing loop finished-----------")
         loc_f1_score = self.evaluator_loc.Pixel_F1_score()
         damage_f1_score = self.evaluator_clf.Damage_F1_score()
         harmonic_mean_f1 = len(damage_f1_score) / np.sum(1.0 / (damage_f1_score + 1e-8))
@@ -335,11 +352,11 @@ class Trainer(object):
         if not os.path.exists(self.model_save_path):
             os.makedirs(self.model_save_path)
 
-        # Plot 1: Main losses (BDA, Combined Instance, Total)
+        # Plot 1: Main losses (BDA, Instance, Total)
         plt.figure(figsize=(12, 6))
         plt.plot(self.iterations, self.final_losses, label='Total Loss', color='red', alpha=0.8)
         plt.plot(self.iterations, self.bda_losses, label='BDA Loss', color='blue', alpha=0.8)
-        plt.plot(self.iterations, self.inst_combined_losses, label=f'Instance Combined Loss (Weighted)', color='green', alpha=0.8)
+        plt.plot(self.iterations, self.inst_losses, label=f'Instance Consistency Loss (Weighted, alpha={self.args.alpha}, beta={self.args.beta})', color='green', alpha=0.8)
         plt.xlabel('Iteration')
         plt.ylabel('Loss Value')
         plt.title('Training Losses Over Iterations')
@@ -349,52 +366,33 @@ class Trainer(object):
         plot_path_main = os.path.join(self.model_save_path, 'training_losses_main.png')
         plt.savefig(plot_path_main)
         print(f"Main loss plot saved to {plot_path_main}")
+        # plt.show() # Uncomment to display plot during execution
 
-        # Plot 2: Unweighted Instance Consistency Components
+        # Plot 2: Unweighted Instance Consistency Losses
         plt.figure(figsize=(12, 6))
-        plt.plot(self.iterations, self.inst_loc_consistency_losses_unweighted, label='Loc Consistency Loss (Unweighted)', color='darkmagenta', alpha=0.8)
-        plt.plot(self.iterations, self.inst_clf_consistency_losses_unweighted, label='Clf Consistency Loss (Unweighted)', color='darkorange', alpha=0.8)
+        plt.plot(self.iterations, self.inst_loc_losses_unweighted, label='Instance Localization Loss (Unweighted)', color='purple', alpha=0.8)
+        plt.plot(self.iterations, self.inst_clf_losses_unweighted, label='Instance Classification Loss (Unweighted)', color='orange', alpha=0.8)
         plt.xlabel('Iteration')
         plt.ylabel('Loss Value')
-        plt.title('Unweighted Instance Consistency Components')
+        plt.title('Unweighted Instance Consistency Losses Over Iterations')
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plot_path_inst_consist = os.path.join(self.model_save_path, 'training_losses_instance_consistency_unweighted.png')
-        plt.savefig(plot_path_inst_consist)
-        print(f"Unweighted instance consistency plot saved to {plot_path_inst_consist}")
-
-        # Plot 3: Unweighted Instance Separation Components
-        plt.figure(figsize=(12, 6))
-        plt.plot(self.iterations, self.inst_loc_separation_losses_unweighted, label='Loc Separation Loss (Unweighted)', color='teal', alpha=0.8)
-        plt.plot(self.iterations, self.inst_clf_separation_losses_unweighted, label='Clf Separation Loss (Unweighted)', color='olive', alpha=0.8)
-        plt.xlabel('Iteration')
-        plt.ylabel('Loss Value')
-        plt.title(f'Unweighted Instance Separation Components (Margin={self.args.separation_margin})')
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plot_path_inst_sep = os.path.join(self.model_save_path, 'training_losses_instance_separation_unweighted.png')
-        plt.savefig(plot_path_inst_sep)
-        print(f"Unweighted instance separation plot saved to {plot_path_inst_sep}")
+        plot_path_inst = os.path.join(self.model_save_path, 'training_losses_instance_unweighted.png')
+        plt.savefig(plot_path_inst)
+        print(f"Unweighted instance loss plot saved to {plot_path_inst}")
+        # plt.show() # Uncomment to display plot during execution
 
 def main():
-    parser = argparse.ArgumentParser(description="Training on BRIGHT dataset with Instance Consistency Regularization")
+    parser = argparse.ArgumentParser(description="Training on xBD dataset")
     parser.add_argument('--cfg', type=str, default='/home/songjian/project/MambaCD/VMamba/classification/configs/vssm1/vssm_base_224.yaml')
-    parser.add_argument(
-        "--opts",
-        help="Modify config options by adding 'KEY VALUE' pairs. ",
-        default=None,
-        nargs='+',
-    )
+    parser.add_argument('--opts', default=None, nargs='+', help="Modify config options by adding 'KEY VALUE' pairs.")
     parser.add_argument('--pretrained_weight_path', type=str)
-
     parser.add_argument('--dataset', type=str, default='xBD')
     parser.add_argument('--type', type=str, default='train')
     parser.add_argument('--train_dataset_path', type=str)
     parser.add_argument('--test_dataset_path', type=str)
     parser.add_argument('--val_dataset_path', type=str)
-
     parser.add_argument('--train_data_list_path', type=str)
     parser.add_argument('--test_data_list_path', type=str)
     parser.add_argument('--val_data_list_path', type=str)
@@ -404,43 +402,33 @@ def main():
     parser.add_argument('--train_data_name_list', type=list)
     parser.add_argument('--test_data_name_list', type=list)
     parser.add_argument('--val_data_name_list', type=list)
-
     parser.add_argument('--start_iter', type=int, default=0)
     parser.add_argument('--cuda', type=bool, default=True)
     parser.add_argument('--max_iters', type=int, default=240000)
     parser.add_argument('--model_type', type=str, default='MMMambaBDA')
     parser.add_argument('--model_param_path', type=str, default='../saved_models')
-
     parser.add_argument('--resume', type=str)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=5e-3)
     parser.add_argument('--num_workers', type=int)
-
-    # Arguments for Instance Consistency Loss (PULL term)
-    parser.add_argument('--alpha', type=float, default=0.5, help='Weight for the localization instance combined (consistency+separation) loss component.')
-    parser.add_argument('--beta', type=float, default=0.5, help='Weight for the classification instance combined (consistency+separation) loss component.')
+    parser.add_argument('--alpha', type=float, default=0.5, help="Weight for the localization component of the force-directed loss.")
+    parser.add_argument('--beta', type=float, default=0.5, help="Weight for the classification component of the force-directed loss.")
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     
-    # New Arguments for Instance Separation Loss (PUSH term)
-    parser.add_argument('--separation_margin', type=float, default=1.0, 
-                        help='Margin for the instance separation (repulsion) loss. Squared Euclidean distance.')
-    parser.add_argument('--separation_weight', type=float, default=0.1, 
-                        help='Weight for the instance separation loss component within a *single* InstanceConsistencyLoss call.')
-
     args = parser.parse_args()
 
-    # Load data name lists
-    with open(args.train_data_list_path, "r") as f:
-        args.train_data_name_list = [name.strip() for name in f]
-    with open(args.test_data_list_path, "r") as f:
-        args.test_data_name_list = [name.strip() for name in f]
-    with open(args.val_data_list_path, "r") as f:
-        args.val_data_name_list = [name.strip() for name in f]
+    # Seed all RNGs
+    set_seed(args.seed)
 
-    # Initialize and start training
+    # Load dataset name lists
+    with open(args.train_data_list_path) as f: args.train_data_name_list = [x.strip() for x in f]
+    with open(args.val_data_list_path) as f: args.val_data_name_list = [x.strip() for x in f]
+    with open(args.test_data_list_path) as f: args.test_data_name_list = [x.strip() for x in f]
+
     trainer = Trainer(args)
     trainer.training()
-    trainer.plot_losses() # Call plot_losses after training completes
+    trainer.plot_losses()
 
 if __name__ == "__main__":
     main()

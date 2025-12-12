@@ -154,6 +154,9 @@ class Trainer(object):
 
         # ⬅️ Added: evaluators for overall performance
         evaluator_total = Evaluator(num_class=4)
+        
+        # Per-event evaluators
+        event_evaluators = {}  # Dict to store evaluators per event
 
         with torch.no_grad():
             for itera, data in enumerate(tqdm(val_data_loader)):
@@ -173,17 +176,33 @@ class Trainer(object):
                 output_clf = output_clf.data.cpu().numpy()
                 output_clf = np.argmax(output_clf, axis=1)
                 labels_clf = labels_clf.cpu().numpy()
+                
+                # Extract event name from the sample name
+                sample_name = names[0]
+                event_name = sample_name.rsplit('_', 1)[0]  # Remove the last underscore and number
+                
+                # Create evaluator for this event if it doesn't exist
+                if event_name not in event_evaluators:
+                    event_evaluators[event_name] = {
+                        'loc': Evaluator(num_class=2),
+                        'clf': Evaluator(num_class=4),
+                        'total': Evaluator(num_class=4)
+                    }
 
                 # Add for localization evaluation
                 self.total_evaluator_loc.add_batch(labels_loc, output_loc)
+                event_evaluators[event_name]['loc'].add_batch(labels_loc, output_loc)
 
                 # Only evaluate damage classes where building exists
                 output_clf_eval = output_clf[labels_loc > 0]
                 labels_clf_eval = labels_clf[labels_loc > 0]
                 self.total_evaluator_clf.add_batch(labels_clf_eval, output_clf_eval)
+                if len(output_clf_eval) > 0:  # Only add if there are buildings
+                    event_evaluators[event_name]['clf'].add_batch(labels_clf_eval, output_clf_eval)
 
                 # ⬅️ Added: total evaluator includes all pixels (for OA & mIoU)
                 evaluator_total.add_batch(labels_clf, output_clf)
+                event_evaluators[event_name]['total'].add_batch(labels_clf, output_clf)
 
                 # ========== Visualization ==========
                 image_name = names[0] + '.png'
@@ -232,6 +251,68 @@ class Trainer(object):
         print(f"OA-F1 (weighted): {oaf1}")
         print("========================\n")
 
+        # ========== Per-Event Metrics ==========
+        print("\n===== PER-EVENT METRICS =====")
+        event_metrics = {}
+        for event_name in sorted(event_evaluators.keys()):
+            evaluators = event_evaluators[event_name]
+            
+            # Localization F1
+            event_loc_f1 = evaluators['loc'].Pixel_F1_score()
+            
+            # Classification F1 (harmonic mean)
+            event_damage_f1 = evaluators['clf'].Damage_F1_score()
+            
+            # Debug: print confusion matrix for this event
+            print(f"\n--- Event: {event_name} ---")
+            print(f"  Classification Confusion Matrix:\n{evaluators['clf'].confusion_matrix}")
+            print(f"  Per-class F1 scores: {event_damage_f1}")
+            
+            # Handle cases where F1 scores might be 0 or invalid
+            # Use only the valid (non-zero, non-nan) F1 scores for harmonic mean
+            valid_mask = (event_damage_f1 > 0) & (~np.isnan(event_damage_f1))
+            valid_f1_scores = event_damage_f1[valid_mask]
+            
+            if len(valid_f1_scores) > 0:
+                # Compute harmonic mean only over valid scores
+                event_harmonic_f1 = len(valid_f1_scores) / np.sum(1.0 / valid_f1_scores)
+            else:
+                # If no valid F1 scores, set to 0
+                event_harmonic_f1 = 0.0
+            
+            # Overall metrics
+            event_oa = evaluators['total'].Pixel_Accuracy()
+            event_miou = evaluators['total'].Mean_Intersection_over_Union()
+            event_iou_per_class = evaluators['total'].Intersection_over_Union()
+            
+            # OA-F1
+            event_oaf1 = 0.3 * event_loc_f1 + 0.7 * event_harmonic_f1
+            
+            event_metrics[event_name] = {
+                "loc F1": event_loc_f1,
+                "clf F1": event_harmonic_f1,
+                "OA": event_oa,
+                "mIoU": event_miou,
+                "sub class IoU": event_iou_per_class,
+                "sub class F1": event_damage_f1,
+                "OA-F1": event_oaf1
+            }
+            
+            # Per-class F1 for this event
+            event_f1_scores_with_classes = ", ".join(
+                [f"{name}: {score:.4f}" for name, score in zip(class_names_for_f1, event_damage_f1)]
+            )
+            
+            print(f"  loc F1: {event_loc_f1:.4f}")
+            print(f"  clf F1: {event_harmonic_f1:.4f}")
+            print(f"  OA: {100 * event_oa:.2f}%")
+            print(f"  mIoU: {100 * event_miou:.2f}%")
+            print(f"  sub class IoU: {100 * event_iou_per_class}")
+            print(f"  sub class F1: {event_f1_scores_with_classes}")
+            print(f"  OA-F1: {event_oaf1:.4f}")
+        
+        print("\n=============================\n")
+
         # ⬅️ Added: Return the metrics if needed by external scripts
         return {
             "loc F1": loc_f1_score,
@@ -240,7 +321,8 @@ class Trainer(object):
             "mIoU": mIoU,
             "sub class IoU": IoU_of_each_class,
             "sub class F1": damage_f1_score,
-            "OA-F1": oaf1
+            "OA-F1": oaf1,
+            "per_event": event_metrics
         }
 
 

@@ -1,6 +1,6 @@
 import torch
 from .Mamba_backbone import Backbone_VSSM
-from classification.models.vmamba import VSSM, LayerNorm2d, VSSBlock, Permute
+from ...classification.models.vmamba import VSSM, LayerNorm2d, VSSBlock, Permute
 
 import torch.nn as nn
 import torch.nn.functional as F
